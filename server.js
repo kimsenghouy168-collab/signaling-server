@@ -18,7 +18,7 @@ const io = new Server(httpServer, {
 
 const rooms = new Map();
 const users = new Map();
-const onlineUsers = new Map();
+const onlineUsers = new Map(); // userId -> {userId, userName, socketId, status}
 const activeGroups = new Map();
 
 app.get('/health', (req, res) => {
@@ -35,26 +35,47 @@ app.get('/health', (req, res) => {
 io.on('connection', (socket) => {
   console.log(`[CONNECT] ${socket.id}`);
 
-  // Register user as online
+  // ✅ Register user as online
   socket.on('register-user', (data) => {
+    // Remove any existing entry for this user (in case of duplicate)
+    const existingEntry = Array.from(onlineUsers.entries()).find(
+      ([_, user]) => user.userId === data.userId
+    );
+    if (existingEntry) {
+      onlineUsers.delete(existingEntry[0]);
+    }
+
     onlineUsers.set(data.userId, {
       userId: data.userId,
       userName: data.userName,
       socketId: socket.id,
       status: 'online'
     });
-    console.log(`[ONLINE] ${data.userName}`);
+    
+    console.log(`[ONLINE] ${data.userName} (${data.userId})`);
     broadcastOnlineUsers();
   });
 
+  // ✅ Update user status
+  socket.on('update-status', (data) => {
+    const user = onlineUsers.get(data.userId);
+    if (user) {
+      user.status = data.status;
+      broadcastOnlineUsers();
+    }
+  });
+
+  // Request online users
   socket.on('request-online-users', () => {
     const usersList = Array.from(onlineUsers.values()).map(u => ({
       userId: u.userId,
-      userName: u.userName
+      userName: u.userName,
+      status: u.status
     }));
     socket.emit('online-users', usersList);
   });
 
+  // Request active groups
   socket.on('request-active-groups', () => {
     const groupsList = Array.from(activeGroups.values()).map(g => ({
       groupId: g.groupId,
@@ -64,6 +85,7 @@ io.on('connection', (socket) => {
     socket.emit('active-groups', groupsList);
   });
 
+  // Initiate 1-to-1 call
   socket.on('initiate-call', (data) => {
     const targetUser = onlineUsers.get(data.toUserId);
     if (targetUser) {
@@ -76,6 +98,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Accept call
   socket.on('accept-call', (data) => {
     const targetUser = onlineUsers.get(data.toUserId);
     if (targetUser) {
@@ -85,6 +108,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Decline call
   socket.on('decline-call', (data) => {
     const targetUser = onlineUsers.get(data.toUserId);
     if (targetUser) {
@@ -94,6 +118,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Create group call
   socket.on('create-group', (data) => {
     activeGroups.set(data.groupId, {
       groupId: data.groupId,
@@ -105,6 +130,7 @@ io.on('connection', (socket) => {
     broadcastActiveGroups();
   });
 
+  // Join room (for WebRTC)
   socket.on('join-room', ({ roomId, userId, userName, role }) => {
     console.log(`[JOIN] ${userName} (${role}) -> Room ${roomId}`);
     
@@ -136,7 +162,6 @@ io.on('connection', (socket) => {
     socket.emit('room-users', existingUsers);
   });
 
-  // ==================== FIXED OFFER ROUTING ====================
   socket.on('offer', (data) => {
     const fromUser = users.get(socket.id);
     if (!fromUser) {
@@ -150,7 +175,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // If targetId is specified, send to that specific user
     if (data.targetId) {
       const targetUser = room.users.get(data.targetId);
       if (targetUser) {
@@ -163,7 +187,6 @@ io.on('connection', (socket) => {
         console.error('[OFFER] Target user not found:', data.targetId);
       }
     } else {
-      // Broadcast to all users in room except sender
       console.log(`[OFFER] ${fromUser.userId} -> all in ${data.roomId}`);
       socket.to(data.roomId).emit('offer', { 
         from: fromUser.userId, 
@@ -172,7 +195,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ==================== FIXED ANSWER ROUTING ====================
   socket.on('answer', (data) => {
     const fromUser = users.get(socket.id);
     if (!fromUser) {
@@ -186,7 +208,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Answer should ALWAYS go to specific target
     if (data.to) {
       const targetUser = room.users.get(data.to);
       if (targetUser) {
@@ -203,7 +224,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ==================== FIXED ICE CANDIDATE ROUTING ====================
   socket.on('ice-candidate', (data) => {
     const fromUser = users.get(socket.id);
     if (!fromUser) return;
@@ -211,7 +231,6 @@ io.on('connection', (socket) => {
     const room = rooms.get(data.roomId);
     if (!room) return;
 
-    // If targetId specified, send to that user, otherwise broadcast
     if (data.targetId) {
       const targetUser = room.users.get(data.targetId);
       if (targetUser) {
@@ -237,8 +256,13 @@ io.on('connection', (socket) => {
     });
   });
 
+  // ✅ Handle user going offline explicitly
   socket.on('user-offline', (data) => {
+    console.log(`[OFFLINE] ${data.userId}`);
     onlineUsers.delete(data.userId);
+    
+    // Notify all clients
+    io.emit('user-offline', { userId: data.userId });
     broadcastOnlineUsers();
   });
 
@@ -246,12 +270,20 @@ io.on('connection', (socket) => {
     handleUserLeave(socket, data.userId, data.roomId);
   });
 
+  // ✅ Handle disconnect - remove from online users
   socket.on('disconnect', () => {
     const user = users.get(socket.id);
     if (user) {
       console.log(`[DISCONNECT] ${user.userName}`);
+      
+      // Remove from rooms
       handleUserLeave(socket, user.userId, user.roomId);
+      
+      // Remove from online users
       onlineUsers.delete(user.userId);
+      
+      // Notify all clients
+      io.emit('user-offline', { userId: user.userId });
       broadcastOnlineUsers();
     }
   });
@@ -283,7 +315,8 @@ io.on('connection', (socket) => {
   function broadcastOnlineUsers() {
     const usersList = Array.from(onlineUsers.values()).map(u => ({
       userId: u.userId,
-      userName: u.userName
+      userName: u.userName,
+      status: u.status || 'online'
     }));
     io.emit('online-users', usersList);
   }
