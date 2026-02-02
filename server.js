@@ -19,26 +19,6 @@ const io = new Server(httpServer, {
 const rooms = new Map();
 const users = new Map();
 
-app.get('/api/turn', (req, res) => {
-  const turnConfig = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' }
-    ]
-  };
-  
-  if (process.env.TURN_URL) {
-    turnConfig.iceServers.push({
-      urls: process.env.TURN_URL,
-      username: process.env.TURN_USERNAME,
-      credential: process.env.TURN_CREDENTIAL
-    });
-  }
-  
-  res.json(turnConfig);
-});
-
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -52,20 +32,15 @@ io.on('connection', (socket) => {
   console.log(`[CONNECT] ${socket.id}`);
 
   socket.on('join-room', ({ roomId, userId, userName, role }) => {
-    console.log(`[JOIN-ROOM] ${userName} (${role}) -> Room ${roomId}`);
+    console.log(`[JOIN] ${userName} (${role}) -> Room ${roomId}`);
     
-    // Leave previous rooms
     socket.rooms.forEach(room => { 
       if(room !== socket.id) socket.leave(room); 
     });
     
-    // Join new room
     socket.join(roomId);
-    
-    // Store user data
     users.set(socket.id, { userId, userName, role, roomId });
 
-    // Initialize room if needed
     if (!rooms.has(roomId)) {
       rooms.set(roomId, { id: roomId, users: new Map() });
     }
@@ -73,23 +48,52 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     room.users.set(userId, { userId, userName, role, socketId: socket.id });
 
-    // Notify others
     socket.to(roomId).emit('user-joined', { userId, userName, role });
     
-    // Send existing users to new joiner
     const existingUsers = Array.from(room.users.values())
       .filter(u => u.userId !== userId)
       .map(u => ({ userId: u.userId, userName: u.userName, role: u.role }));
         
     socket.emit('room-users', existingUsers);
-    
-    console.log(`[ROOM-${roomId}] Users: ${room.users.size}`);
+  });
+
+  socket.on('call-request', (data) => {
+    const room = rooms.get(data.roomId);
+    const target = room?.users.get(data.toUserId);
+    if (target) {
+      console.log(`[CALL-REQUEST] ${data.fromUserName} -> ${data.toUserId}`);
+      io.to(target.socketId).emit('call-request', {
+        fromUserId: data.fromUserId,
+        fromUserName: data.fromUserName
+      });
+    }
+  });
+
+  socket.on('call-accepted', (data) => {
+    const room = rooms.get(data.roomId);
+    const target = room?.users.get(data.toUserId);
+    if (target) {
+      console.log(`[CALL-ACCEPTED] ${data.userId} accepted call from ${data.toUserId}`);
+      io.to(target.socketId).emit('call-accepted', {
+        userId: data.userId
+      });
+    }
+  });
+
+  socket.on('call-declined', (data) => {
+    const room = rooms.get(data.roomId);
+    const target = room?.users.get(data.toUserId);
+    if (target) {
+      console.log(`[CALL-DECLINED] ${data.userId} declined call from ${data.toUserId}`);
+      io.to(target.socketId).emit('call-declined', {
+        userId: data.userId
+      });
+    }
   });
 
   socket.on('offer', (data) => {
     const fromUser = users.get(socket.id);
     if (fromUser) {
-      console.log(`[OFFER] ${fromUser.userId} -> room ${data.roomId}`);
       socket.to(data.roomId).emit('offer', { 
         from: fromUser.userId, 
         offer: data.offer 
@@ -100,7 +104,6 @@ io.on('connection', (socket) => {
   socket.on('answer', (data) => {
     const fromUser = users.get(socket.id);
     if (fromUser && data.to) {
-      console.log(`[ANSWER] ${fromUser.userId} -> ${data.to}`);
       const room = rooms.get(data.roomId);
       const target = room?.users.get(data.to);
       if (target) {
@@ -123,16 +126,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat-message', (data) => {
-    const fromUser = users.get(socket.id);
-    if (fromUser) {
-      console.log(`[CHAT] ${data.fromUserName}: ${data.message}`);
-      socket.to(data.roomId).emit('chat-message', {
-        fromUserId: data.fromUserId,
-        fromUserName: data.fromUserName,
-        message: data.message,
-        timestamp: Date.now()
-      });
-    }
+    socket.to(data.roomId).emit('chat-message', {
+      fromUserId: data.fromUserId,
+      fromUserName: data.fromUserName,
+      message: data.message,
+      timestamp: Date.now()
+    });
   });
 
   socket.on('leave-room', (data) => {
@@ -142,7 +141,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const user = users.get(socket.id);
     if (user) {
-      console.log(`[DISCONNECT] ${user.userName} from room ${user.roomId}`);
+      console.log(`[DISCONNECT] ${user.userName}`);
       handleUserLeave(socket, user.userId, user.roomId);
     }
   });
@@ -155,9 +154,6 @@ io.on('connection', (socket) => {
       room.users.delete(userId);
       if (room.users.size === 0) {
         rooms.delete(roomId);
-        console.log(`[ROOM-${roomId}] Deleted (empty)`);
-      } else {
-        console.log(`[ROOM-${roomId}] Users remaining: ${room.users.size}`);
       }
     }
     
@@ -168,7 +164,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  console.log(`🚀 Signaling Server running on port ${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/health`);
-  console.log(`   TURN Config: http://localhost:${PORT}/api/turn`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
