@@ -11,21 +11,23 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 
 const io = new Server(httpServer, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  transports: ['websocket', 'polling']
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 const rooms = new Map();
 const users = new Map();
 
-// --- TURN SERVER CONFIG ---
 app.get('/api/turn', (req, res) => {
   const turnConfig = {
     iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' }, // Standard STUN
+      { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' }
     ]
   };
-  // If you have TURN credentials in .env, add them here
+  
   if (process.env.TURN_URL) {
     turnConfig.iceServers.push({
       urls: process.env.TURN_URL,
@@ -33,87 +35,140 @@ app.get('/api/turn', (req, res) => {
       credential: process.env.TURN_CREDENTIAL
     });
   }
+  
   res.json(turnConfig);
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    rooms: rooms.size, 
+    users: users.size,
+    timestamp: new Date().toISOString()
+  });
 });
 
 io.on('connection', (socket) => {
   console.log(`[CONNECT] ${socket.id}`);
 
   socket.on('join-room', ({ roomId, userId, userName, role }) => {
-    // 1. Leave previous rooms
-    socket.rooms.forEach(room => { if(room !== socket.id) socket.leave(room); });
+    console.log(`[JOIN-ROOM] ${userName} (${role}) -> Room ${roomId}`);
     
-    // 2. Join New Room
+    // Leave previous rooms
+    socket.rooms.forEach(room => { 
+      if(room !== socket.id) socket.leave(room); 
+    });
+    
+    // Join new room
     socket.join(roomId);
     
-    // 3. Store Data
+    // Store user data
     users.set(socket.id, { userId, userName, role, roomId });
 
+    // Initialize room if needed
     if (!rooms.has(roomId)) {
       rooms.set(roomId, { id: roomId, users: new Map() });
     }
+    
     const room = rooms.get(roomId);
     room.users.set(userId, { userId, userName, role, socketId: socket.id });
 
-    console.log(`[JOIN] ${userName} (${role}) -> Room ${roomId}`);
-
-    // 4. Notify Others
+    // Notify others
     socket.to(roomId).emit('user-joined', { userId, userName, role });
     
-    // 5. Send list of existing users to the new person
-    // This triggers the connection process from the Client Side
+    // Send existing users to new joiner
     const existingUsers = Array.from(room.users.values())
-        .filter(u => u.userId !== userId)
-        .map(u => ({ userId: u.userId, userName: u.userName, role: u.role }));
+      .filter(u => u.userId !== userId)
+      .map(u => ({ userId: u.userId, userName: u.userName, role: u.role }));
         
     socket.emit('room-users', existingUsers);
+    
+    console.log(`[ROOM-${roomId}] Users: ${room.users.size}`);
   });
 
-  // Signaling Relays
   socket.on('offer', (data) => {
     const fromUser = users.get(socket.id);
     if (fromUser) {
-        socket.to(data.roomId).emit('offer', { from: fromUser.userId, offer: data.offer });
+      console.log(`[OFFER] ${fromUser.userId} -> room ${data.roomId}`);
+      socket.to(data.roomId).emit('offer', { 
+        from: fromUser.userId, 
+        offer: data.offer 
+      });
     }
   });
 
   socket.on('answer', (data) => {
     const fromUser = users.get(socket.id);
     if (fromUser && data.to) {
-        // Find socket ID of target
-        const room = rooms.get(data.roomId);
-        const target = room?.users.get(data.to);
-        if (target) {
-            io.to(target.socketId).emit('answer', { from: fromUser.userId, answer: data.answer });
-        }
+      console.log(`[ANSWER] ${fromUser.userId} -> ${data.to}`);
+      const room = rooms.get(data.roomId);
+      const target = room?.users.get(data.to);
+      if (target) {
+        io.to(target.socketId).emit('answer', { 
+          from: fromUser.userId, 
+          answer: data.answer 
+        });
+      }
     }
   });
 
   socket.on('ice-candidate', (data) => {
     const fromUser = users.get(socket.id);
     if (fromUser) {
-        // Broadcast to room (simplest for mesh) or target specific user
-        socket.to(data.roomId).emit('ice-candidate', { from: fromUser.userId, candidate: data.candidate });
+      socket.to(data.roomId).emit('ice-candidate', { 
+        from: fromUser.userId, 
+        candidate: data.candidate 
+      });
     }
+  });
+
+  socket.on('chat-message', (data) => {
+    const fromUser = users.get(socket.id);
+    if (fromUser) {
+      console.log(`[CHAT] ${data.fromUserName}: ${data.message}`);
+      socket.to(data.roomId).emit('chat-message', {
+        fromUserId: data.fromUserId,
+        fromUserName: data.fromUserName,
+        message: data.message,
+        timestamp: Date.now()
+      });
+    }
+  });
+
+  socket.on('leave-room', (data) => {
+    handleUserLeave(socket, data.userId, data.roomId);
   });
 
   socket.on('disconnect', () => {
     const user = users.get(socket.id);
     if (user) {
-      console.log(`[DISCONNECT] ${user.userName}`);
-      socket.to(user.roomId).emit('user-left', { userId: user.userId });
-      
-      const room = rooms.get(user.roomId);
-      if (room) {
-        room.users.delete(user.userId);
-        if (room.users.size === 0) rooms.delete(user.roomId);
-      }
-      users.delete(socket.id);
+      console.log(`[DISCONNECT] ${user.userName} from room ${user.roomId}`);
+      handleUserLeave(socket, user.userId, user.roomId);
     }
   });
+
+  function handleUserLeave(socket, userId, roomId) {
+    socket.to(roomId).emit('user-left', { userId });
+    
+    const room = rooms.get(roomId);
+    if (room) {
+      room.users.delete(userId);
+      if (room.users.size === 0) {
+        rooms.delete(roomId);
+        console.log(`[ROOM-${roomId}] Deleted (empty)`);
+      } else {
+        console.log(`[ROOM-${roomId}] Users remaining: ${room.users.size}`);
+      }
+    }
+    
+    users.delete(socket.id);
+    socket.leave(roomId);
+  }
 });
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Signaling Server running on port ${PORT}`);
+  console.log(`   Health: http://localhost:${PORT}/health`);
+  console.log(`   TURN Config: http://localhost:${PORT}/api/turn`);
 });
