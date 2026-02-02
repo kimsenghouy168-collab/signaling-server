@@ -18,8 +18,8 @@ const io = new Server(httpServer, {
 
 const rooms = new Map();
 const users = new Map();
-const onlineUsers = new Map(); // For call lobby
-const activeGroups = new Map(); // For group calls
+const onlineUsers = new Map();
+const activeGroups = new Map();
 
 app.get('/health', (req, res) => {
   res.json({ 
@@ -47,7 +47,6 @@ io.on('connection', (socket) => {
     broadcastOnlineUsers();
   });
 
-  // Request online users
   socket.on('request-online-users', () => {
     const usersList = Array.from(onlineUsers.values()).map(u => ({
       userId: u.userId,
@@ -56,7 +55,6 @@ io.on('connection', (socket) => {
     socket.emit('online-users', usersList);
   });
 
-  // Request active groups
   socket.on('request-active-groups', () => {
     const groupsList = Array.from(activeGroups.values()).map(g => ({
       groupId: g.groupId,
@@ -66,7 +64,6 @@ io.on('connection', (socket) => {
     socket.emit('active-groups', groupsList);
   });
 
-  // Initiate 1-to-1 call
   socket.on('initiate-call', (data) => {
     const targetUser = onlineUsers.get(data.toUserId);
     if (targetUser) {
@@ -79,7 +76,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Accept call
   socket.on('accept-call', (data) => {
     const targetUser = onlineUsers.get(data.toUserId);
     if (targetUser) {
@@ -89,7 +85,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Decline call
   socket.on('decline-call', (data) => {
     const targetUser = onlineUsers.get(data.toUserId);
     if (targetUser) {
@@ -99,7 +94,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Create group call
   socket.on('create-group', (data) => {
     activeGroups.set(data.groupId, {
       groupId: data.groupId,
@@ -111,7 +105,6 @@ io.on('connection', (socket) => {
     broadcastActiveGroups();
   });
 
-  // Join room (for WebRTC)
   socket.on('join-room', ({ roomId, userId, userName, role }) => {
     console.log(`[JOIN] ${userName} (${role}) -> Room ${roomId}`);
     
@@ -129,7 +122,6 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     room.users.set(userId, { userId, userName, role, socketId: socket.id });
 
-    // Add to group participants if it's a group
     if (activeGroups.has(roomId)) {
       activeGroups.get(roomId).participants.add(userId);
       broadcastActiveGroups();
@@ -144,9 +136,35 @@ io.on('connection', (socket) => {
     socket.emit('room-users', existingUsers);
   });
 
+  // ==================== FIXED OFFER ROUTING ====================
   socket.on('offer', (data) => {
     const fromUser = users.get(socket.id);
-    if (fromUser) {
+    if (!fromUser) {
+      console.error('[OFFER] Sender not found');
+      return;
+    }
+
+    const room = rooms.get(data.roomId);
+    if (!room) {
+      console.error('[OFFER] Room not found:', data.roomId);
+      return;
+    }
+
+    // If targetId is specified, send to that specific user
+    if (data.targetId) {
+      const targetUser = room.users.get(data.targetId);
+      if (targetUser) {
+        console.log(`[OFFER] ${fromUser.userId} -> ${data.targetId}`);
+        io.to(targetUser.socketId).emit('offer', { 
+          from: fromUser.userId, 
+          offer: data.offer 
+        });
+      } else {
+        console.error('[OFFER] Target user not found:', data.targetId);
+      }
+    } else {
+      // Broadcast to all users in room except sender
+      console.log(`[OFFER] ${fromUser.userId} -> all in ${data.roomId}`);
       socket.to(data.roomId).emit('offer', { 
         from: fromUser.userId, 
         offer: data.offer 
@@ -154,23 +172,55 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ==================== FIXED ANSWER ROUTING ====================
   socket.on('answer', (data) => {
     const fromUser = users.get(socket.id);
-    if (fromUser && data.to) {
-      const room = rooms.get(data.roomId);
-      const target = room?.users.get(data.to);
-      if (target) {
-        io.to(target.socketId).emit('answer', { 
+    if (!fromUser) {
+      console.error('[ANSWER] Sender not found');
+      return;
+    }
+
+    const room = rooms.get(data.roomId);
+    if (!room) {
+      console.error('[ANSWER] Room not found:', data.roomId);
+      return;
+    }
+
+    // Answer should ALWAYS go to specific target
+    if (data.to) {
+      const targetUser = room.users.get(data.to);
+      if (targetUser) {
+        console.log(`[ANSWER] ${fromUser.userId} -> ${data.to}`);
+        io.to(targetUser.socketId).emit('answer', { 
           from: fromUser.userId, 
           answer: data.answer 
         });
+      } else {
+        console.error('[ANSWER] Target not found:', data.to);
       }
+    } else {
+      console.error('[ANSWER] No target specified');
     }
   });
 
+  // ==================== FIXED ICE CANDIDATE ROUTING ====================
   socket.on('ice-candidate', (data) => {
     const fromUser = users.get(socket.id);
-    if (fromUser) {
+    if (!fromUser) return;
+
+    const room = rooms.get(data.roomId);
+    if (!room) return;
+
+    // If targetId specified, send to that user, otherwise broadcast
+    if (data.targetId) {
+      const targetUser = room.users.get(data.targetId);
+      if (targetUser) {
+        io.to(targetUser.socketId).emit('ice-candidate', { 
+          from: fromUser.userId, 
+          candidate: data.candidate 
+        });
+      }
+    } else {
       socket.to(data.roomId).emit('ice-candidate', { 
         from: fromUser.userId, 
         candidate: data.candidate 
