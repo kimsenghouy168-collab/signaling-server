@@ -18,12 +18,16 @@ const io = new Server(httpServer, {
 
 const rooms = new Map();
 const users = new Map();
+const onlineUsers = new Map(); // For call lobby
+const activeGroups = new Map(); // For group calls
 
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     rooms: rooms.size, 
     users: users.size,
+    onlineUsers: onlineUsers.size,
+    activeGroups: activeGroups.size,
     timestamp: new Date().toISOString()
   });
 });
@@ -31,6 +35,83 @@ app.get('/health', (req, res) => {
 io.on('connection', (socket) => {
   console.log(`[CONNECT] ${socket.id}`);
 
+  // Register user as online
+  socket.on('register-user', (data) => {
+    onlineUsers.set(data.userId, {
+      userId: data.userId,
+      userName: data.userName,
+      socketId: socket.id,
+      status: 'online'
+    });
+    console.log(`[ONLINE] ${data.userName}`);
+    broadcastOnlineUsers();
+  });
+
+  // Request online users
+  socket.on('request-online-users', () => {
+    const usersList = Array.from(onlineUsers.values()).map(u => ({
+      userId: u.userId,
+      userName: u.userName
+    }));
+    socket.emit('online-users', usersList);
+  });
+
+  // Request active groups
+  socket.on('request-active-groups', () => {
+    const groupsList = Array.from(activeGroups.values()).map(g => ({
+      groupId: g.groupId,
+      groupName: g.groupName,
+      participantCount: g.participants.size
+    }));
+    socket.emit('active-groups', groupsList);
+  });
+
+  // Initiate 1-to-1 call
+  socket.on('initiate-call', (data) => {
+    const targetUser = onlineUsers.get(data.toUserId);
+    if (targetUser) {
+      io.to(targetUser.socketId).emit('call-request', {
+        fromUserId: data.fromUserId,
+        fromUserName: data.fromUserName,
+        callId: data.callId
+      });
+      console.log(`[CALL] ${data.fromUserName} -> ${data.toUserId}`);
+    }
+  });
+
+  // Accept call
+  socket.on('accept-call', (data) => {
+    const targetUser = onlineUsers.get(data.toUserId);
+    if (targetUser) {
+      io.to(targetUser.socketId).emit('call-accepted', {
+        callId: data.callId
+      });
+    }
+  });
+
+  // Decline call
+  socket.on('decline-call', (data) => {
+    const targetUser = onlineUsers.get(data.toUserId);
+    if (targetUser) {
+      io.to(targetUser.socketId).emit('call-declined', {
+        callId: data.callId
+      });
+    }
+  });
+
+  // Create group call
+  socket.on('create-group', (data) => {
+    activeGroups.set(data.groupId, {
+      groupId: data.groupId,
+      groupName: data.groupName,
+      creatorId: data.creatorId,
+      participants: new Set([data.creatorId])
+    });
+    console.log(`[GROUP CREATED] ${data.groupName}`);
+    broadcastActiveGroups();
+  });
+
+  // Join room (for WebRTC)
   socket.on('join-room', ({ roomId, userId, userName, role }) => {
     console.log(`[JOIN] ${userName} (${role}) -> Room ${roomId}`);
     
@@ -48,6 +129,12 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     room.users.set(userId, { userId, userName, role, socketId: socket.id });
 
+    // Add to group participants if it's a group
+    if (activeGroups.has(roomId)) {
+      activeGroups.get(roomId).participants.add(userId);
+      broadcastActiveGroups();
+    }
+
     socket.to(roomId).emit('user-joined', { userId, userName, role });
     
     const existingUsers = Array.from(room.users.values())
@@ -55,40 +142,6 @@ io.on('connection', (socket) => {
       .map(u => ({ userId: u.userId, userName: u.userName, role: u.role }));
         
     socket.emit('room-users', existingUsers);
-  });
-
-  socket.on('call-request', (data) => {
-    const room = rooms.get(data.roomId);
-    const target = room?.users.get(data.toUserId);
-    if (target) {
-      console.log(`[CALL-REQUEST] ${data.fromUserName} -> ${data.toUserId}`);
-      io.to(target.socketId).emit('call-request', {
-        fromUserId: data.fromUserId,
-        fromUserName: data.fromUserName
-      });
-    }
-  });
-
-  socket.on('call-accepted', (data) => {
-    const room = rooms.get(data.roomId);
-    const target = room?.users.get(data.toUserId);
-    if (target) {
-      console.log(`[CALL-ACCEPTED] ${data.userId} accepted call from ${data.toUserId}`);
-      io.to(target.socketId).emit('call-accepted', {
-        userId: data.userId
-      });
-    }
-  });
-
-  socket.on('call-declined', (data) => {
-    const room = rooms.get(data.roomId);
-    const target = room?.users.get(data.toUserId);
-    if (target) {
-      console.log(`[CALL-DECLINED] ${data.userId} declined call from ${data.toUserId}`);
-      io.to(target.socketId).emit('call-declined', {
-        userId: data.userId
-      });
-    }
   });
 
   socket.on('offer', (data) => {
@@ -134,6 +187,11 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('user-offline', (data) => {
+    onlineUsers.delete(data.userId);
+    broadcastOnlineUsers();
+  });
+
   socket.on('leave-room', (data) => {
     handleUserLeave(socket, data.userId, data.roomId);
   });
@@ -143,6 +201,8 @@ io.on('connection', (socket) => {
     if (user) {
       console.log(`[DISCONNECT] ${user.userName}`);
       handleUserLeave(socket, user.userId, user.roomId);
+      onlineUsers.delete(user.userId);
+      broadcastOnlineUsers();
     }
   });
 
@@ -154,11 +214,37 @@ io.on('connection', (socket) => {
       room.users.delete(userId);
       if (room.users.size === 0) {
         rooms.delete(roomId);
+        if (activeGroups.has(roomId)) {
+          activeGroups.delete(roomId);
+          broadcastActiveGroups();
+        }
       }
+    }
+    
+    if (activeGroups.has(roomId)) {
+      activeGroups.get(roomId).participants.delete(userId);
+      broadcastActiveGroups();
     }
     
     users.delete(socket.id);
     socket.leave(roomId);
+  }
+
+  function broadcastOnlineUsers() {
+    const usersList = Array.from(onlineUsers.values()).map(u => ({
+      userId: u.userId,
+      userName: u.userName
+    }));
+    io.emit('online-users', usersList);
+  }
+
+  function broadcastActiveGroups() {
+    const groupsList = Array.from(activeGroups.values()).map(g => ({
+      groupId: g.groupId,
+      groupName: g.groupName,
+      participantCount: g.participants.size
+    }));
+    io.emit('active-groups', groupsList);
   }
 });
 
