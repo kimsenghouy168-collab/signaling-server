@@ -478,11 +478,30 @@ io.on('connection', (socket) => {
         break;
         
       case 'lower_all_hands':
-        if (fromUser.role === 'HOST' || fromUser.role === 'CO_HOST') {
-          room.users.forEach(u => u.isHandRaised = false);
-          io.to(data.roomId).emit('all-hands-lowered');
-        }
-        break;
+  if (fromUser.role === 'HOST' || fromUser.role === 'CO_HOST') {
+    console.log('========================================');
+    console.log(`🚀 LOWERING ALL HANDS in room ${data.roomId}`);
+    console.log(`   Requested by: ${fromUser.userName} (${fromUser.userId})`);
+    
+    room.users.forEach(u => {
+      console.log(`   - Lowering hand for: ${u.userName} (was: ${u.isHandRaised})`);
+      u.isHandRaised = false;
+    });
+    
+    // Broadcast to ALL users in room (including host)
+    io.to(data.roomId).emit('all-hands-lowered', {
+      byHost: fromUser.userId,
+      timestamp: Date.now()
+    });
+    
+    console.log(`   ✅ Broadcasted to room ${data.roomId}`);
+    console.log(`   Total users in room: ${room.users.size}`);
+    console.log('========================================');
+  } else {
+    console.log(`⚠️ Unauthorized lower_all_hands attempt by ${fromUser.userName}`);
+  }
+  break;
+
     }
   });
 
