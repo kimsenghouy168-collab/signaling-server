@@ -226,15 +226,17 @@ io.on('connection', (socket) => {
 
   // ==================== WEBRTC SIGNALING ====================
   
-  socket.on('offer', (data) => {
+ socket.on('offer', (data) => {
     const fromUser = users.get(socket.id);
     if (!fromUser) return;
 
-    const room = rooms.get(data.roomId);
-    if (!room) return;
+    // ✅ FIX: Support both targetId and to (backward compatibility)
+    const targetId = data.targetId || data.to;
 
-    if (data.targetId) {
-      const targetUser = room.users.get(data.targetId);
+    if (targetId) {
+      const room = rooms.get(data.roomId);
+      // Optional chaining (?.) prevents crash if room is undefined
+      const targetUser = room?.users.get(targetId);
       if (targetUser) {
         io.to(targetUser.socketId).emit('offer', { 
           from: fromUser.userId, 
@@ -242,6 +244,7 @@ io.on('connection', (socket) => {
         });
       }
     } else {
+      // Broadcast offer (Mesh topology fallback)
       socket.to(data.roomId).emit('offer', { 
         from: fromUser.userId, 
         offer: data.offer 
@@ -253,16 +256,20 @@ io.on('connection', (socket) => {
     const fromUser = users.get(socket.id);
     if (!fromUser) return;
 
-    const room = rooms.get(data.roomId);
-    if (!room) return;
+    // ✅ FIX: The critical fix for the "Stuck Video" issue
+    const targetId = data.targetId || data.to;
 
-    if (data.to) {
-      const targetUser = room.users.get(data.to);
+    if (targetId) {
+      const room = rooms.get(data.roomId);
+      const targetUser = room?.users.get(targetId);
       if (targetUser) {
         io.to(targetUser.socketId).emit('answer', { 
           from: fromUser.userId, 
           answer: data.answer 
         });
+        console.log(`[ANSWER] ${fromUser.userId} -> ${targetId}`);
+      } else {
+        console.log(`[ANSWER] Failed: Target ${targetId} not found`);
       }
     }
   });
@@ -271,11 +278,11 @@ io.on('connection', (socket) => {
     const fromUser = users.get(socket.id);
     if (!fromUser) return;
 
-    const room = rooms.get(data.roomId);
-    if (!room) return;
+    const targetId = data.targetId || data.to;
 
-    if (data.targetId) {
-      const targetUser = room.users.get(data.targetId);
+    if (targetId) {
+      const room = rooms.get(data.roomId);
+      const targetUser = room?.users.get(targetId);
       if (targetUser) {
         io.to(targetUser.socketId).emit('ice-candidate', { 
           from: fromUser.userId, 
